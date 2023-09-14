@@ -528,7 +528,7 @@ class GCSFileSystem(AsyncFileSystem):
                 maxResults=1 if not generation else None,
                 versions="true" if generation else None,
             )
-            for item in resp.get("items", []):
+            for item in self._filter_ghost_items(resp.get("items", [])):
                 if item["name"] == key and (
                     not generation or item.get("generation") == generation
                 ):
@@ -591,6 +591,19 @@ class GCSFileSystem(AsyncFileSystem):
         if not prefix and use_snapshot_listing is False:
             self.dircache[path] = out
         return out
+
+    @staticmethod
+    def _filter_ghost_items(items):
+        if not items:
+            items = []
+
+        filtered_items = []
+
+        for item in items:
+            if item.get("kind", "") != "storage#object" and item.get("size", "0") != "0":
+                filtered_items.append(item)
+
+        return filtered_items
 
     async def _do_list_objects(
         self, path, max_results=None, delimiter="/", prefix="", versions=False, **kwargs
@@ -746,7 +759,7 @@ class GCSFileSystem(AsyncFileSystem):
         )
 
         prefixes.extend(page.get("prefixes", []))
-        items.extend(page.get("items", []))
+        items.extend(self._filter_ghost_items(page.get("items", [])))
         next_page_token = page.get("nextPageToken", None)
 
         while next_page_token is not None:
@@ -766,7 +779,7 @@ class GCSFileSystem(AsyncFileSystem):
 
             assert page["kind"] == "storage#objects"
             prefixes.extend(page.get("prefixes", []))
-            items.extend(page.get("items", []))
+            items.extend(self._filter_ghost_items(page.get("items", [])))
             next_page_token = page.get("nextPageToken", None)
 
         items = [self._process_object(bucket, i) for i in items]
@@ -780,7 +793,7 @@ class GCSFileSystem(AsyncFileSystem):
             page = await self._call("GET", "b", project=self.project, json_out=True)
 
             assert page["kind"] == "storage#buckets"
-            items.extend(page.get("items", []))
+            items.extend(self._filter_ghost_items(page.get("items", [])))
             next_page_token = page.get("nextPageToken", None)
 
             while next_page_token is not None:
@@ -793,7 +806,7 @@ class GCSFileSystem(AsyncFileSystem):
                 )
 
                 assert page["kind"] == "storage#buckets"
-                items.extend(page.get("items", []))
+                items.extend(self._filter_ghost_items(page.get("items", [])))
                 next_page_token = page.get("nextPageToken", None)
 
             buckets = [
