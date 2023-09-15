@@ -564,10 +564,12 @@ class GCSFileSystem(AsyncFileSystem):
         filtered_items = []
 
         for item in items:
-            if item.get("kind", "") != "storage#object" \
-                and item.get("size", "0") != "0" \
-                and item.get("crc32c", "") != "AAAAAA==":
-                filtered_items.append(item)
+            if item.get("kind", "") == "storage#object" \
+                and item.get("size", "") == "0" \
+                and item.get("crc32c", "") == "AAAAAA==":
+                # This is a ghost item, skip it
+                continue
+            filtered_items.append(item)
 
         return filtered_items
 
