@@ -27,6 +27,10 @@ from .credentials import GoogleCredentials
 from .inventory_report import InventoryReport
 from .retry import errs, retry_request, validate_response
 
+os.register_at_fork(
+    after_in_child=asyn.reset_lock,
+)
+
 logger = logging.getLogger("gcsfs")
 
 
@@ -421,6 +425,8 @@ class GCSFileSystem(asyn.AsyncFileSystem):
         self, method, path, *args, headers=None, json=None, data=None, **kwargs
     ):
         await self._set_session()
+        if hasattr(data, "seek"):
+            data.seek(0)
         async with self.session.request(
             method=method,
             url=self._format_path(path, args),
