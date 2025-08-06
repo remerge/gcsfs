@@ -16,6 +16,7 @@ dependencies:
   - libfuse<3
   - pytest
   - pytest-timeout
+  - pytest-asyncio
   - requests
   - ujson
   - pip:
