@@ -172,20 +172,20 @@ class GoogleCredentials:
 
     def _credentials_valid(self, refresh_buffer):
         return (
-                self.credentials.valid
-                # In addition to checking current validity, we ensure that there is
-                # not a near-future expiry to avoid errors when expiration hits.
-                and (
-                        (
-                                self.credentials.expiry
-                                and (
-                                        self.credentials.expiry.replace(tzinfo=timezone.utc)
-                                        - datetime.now(timezone.utc)
-                                ).total_seconds()
-                                > refresh_buffer
-                        )
-                        or not self.credentials.expiry
+            self.credentials.valid
+            # In addition to checking current validity, we ensure that there is
+            # not a near-future expiry to avoid errors when expiration hits.
+            and (
+                (
+                    self.credentials.expiry
+                    and (
+                        self.credentials.expiry.replace(tzinfo=timezone.utc)
+                        - datetime.now(timezone.utc)
+                    ).total_seconds()
+                    > refresh_buffer
                 )
+                or not self.credentials.expiry
+            )
         )
 
     def maybe_refresh(self, refresh_buffer=300):
