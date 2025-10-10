@@ -204,7 +204,7 @@ class GoogleCredentials:
                 if self._credentials_valid(refresh_buffer):
                     return  # repeat check to avoid race conditions
 
-                logger.debug("GCS refresh")
+                logger.debug("GCS refresh...")
                 try:
                     self.credentials.refresh(req)
                 except gauth.exceptions.RefreshError as error:
