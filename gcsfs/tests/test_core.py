@@ -1287,6 +1287,18 @@ def test_bucket_default_location_overwrite(gcs_factory):
         gcs.rm(bucket_name, recursive=True)
 
 
+def test_dir_marker(gcs):
+    gcs.touch(f"{TEST_BUCKET}/placeholder/")
+    gcs.touch(f"{TEST_BUCKET}/placeholder/inner")
+    out = gcs.find(TEST_BUCKET)
+    assert f"{TEST_BUCKET}/placeholder/" in out
+    gcs.invalidate_cache()
+    out2 = gcs.info(f"{TEST_BUCKET}/placeholder/")
+    out3 = gcs.info(f"{TEST_BUCKET}/placeholder/")
+    assert out2 == out3
+    assert out2["type"] == "directory"
+
+
 def test_mkdir_with_path(gcs):
     with pytest.raises(FileNotFoundError):
         gcs.mkdir(f"{TEST_BUCKET + 'new'}/path", create_parents=False)
