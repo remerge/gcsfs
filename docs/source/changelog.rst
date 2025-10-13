@@ -82,6 +82,16 @@ no changes
 
 * Add seek(0) to request data to prevent issues on retries (#624)
 
+2024.6.1
+--------
+
+no changes
+
+2024.6.0
+--------
+
+* Add seek(0) to request data to prevent issues on retries (#624)
+
 2024.5.0
 --------
 

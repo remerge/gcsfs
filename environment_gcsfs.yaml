@@ -9,7 +9,7 @@ dependencies:
   - fsspec
   - google-api-core
   - google-api-python-client
-  - google-auth
+  - google-auth>=1.2, <2.33
   - google-auth-oauthlib
   - google-cloud-core
   - google-cloud-storage
