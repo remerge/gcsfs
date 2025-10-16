@@ -1,7 +1,5 @@
 #!/usr/bin/env python
 
-import os
-
 from setuptools import setup
 
 import versioneer
@@ -20,18 +18,18 @@ setup(
         "Intended Audience :: Developers",
         "License :: OSI Approved :: BSD License",
         "Operating System :: OS Independent",
-        "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
     ],
     keywords=["google-cloud-storage", "gcloud", "file-system"],
     packages=["gcsfs", "gcsfs.cli"],
     install_requires=[open("requirements.txt").read().strip().split("\n")],
-    long_description=(
-        open("README.rst").read() if os.path.exists("README.rst") else ""
-    ),
     extras_require={"gcsfuse": ["fusepy"], "crc": ["crcmod"]},
-    python_requires=">=3.8",
+    python_requires=">=3.9",
+    long_description_content_type="text/markdown",
+    long_description=open("README.md").read(),
     zip_safe=False,
 )

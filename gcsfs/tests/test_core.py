@@ -24,6 +24,7 @@ from gcsfs.tests.utils import tempdir, tmpfile
 TEST_BUCKET = gcsfs.tests.settings.TEST_BUCKET
 TEST_PROJECT = gcsfs.tests.settings.TEST_PROJECT
 TEST_REQUESTER_PAYS_BUCKET = gcsfs.tests.settings.TEST_REQUESTER_PAYS_BUCKET
+TEST_KMS_KEY = gcsfs.tests.settings.TEST_KMS_KEY
 
 
 def test_simple(gcs, monkeypatch):
@@ -87,6 +88,16 @@ def test_simple_upload(gcs):
     assert gcs.cat(fn) == b"zz"
 
 
+def test_simple_upload_with_kms(gcs):
+    if not gcs.on_google:
+        pytest.skip("emulator does not support kmsKeyName")
+    fn = TEST_BUCKET + "/test"
+    with gcs.open(fn, "wb", content_type="text/plain", kms_key_name=TEST_KMS_KEY) as f:
+        f.write(b"zz")
+    assert gcs.cat(fn) == b"zz"
+    assert TEST_KMS_KEY in gcs.info(fn)["kmsKeyName"]
+
+
 def test_large_upload(gcs):
     orig = gcsfs.core.GCS_MAX_BLOCK_SIZE
     gcsfs.core.GCS_MAX_BLOCK_SIZE = 262144  # minimum block size
@@ -96,6 +107,24 @@ def test_large_upload(gcs):
         with gcs.open(fn, "wb", content_type="application/octet-stream") as f:
             f.write(d)
         assert gcs.cat(fn) == d
+    finally:
+        gcsfs.core.GCS_MAX_BLOCK_SIZE = orig
+
+
+def test_large_upload_with_kms(gcs):
+    if not gcs.on_google:
+        pytest.skip("emulator does not support kmsKeyName")
+    orig = gcsfs.core.GCS_MAX_BLOCK_SIZE
+    gcsfs.core.GCS_MAX_BLOCK_SIZE = 262144  # minimum block size
+    try:
+        fn = TEST_BUCKET + "/test"
+        d = b"7123" * 262144
+        with gcs.open(
+            fn, "wb", content_type="application/octet-stream", kms_key_name=TEST_KMS_KEY
+        ) as f:
+            f.write(d)
+        assert gcs.cat(fn) == d
+        assert TEST_KMS_KEY in gcs.info(fn)["kmsKeyName"]
     finally:
         gcsfs.core.GCS_MAX_BLOCK_SIZE = orig
 
@@ -127,6 +156,53 @@ def test_multi_upload(gcs):
         f.write(b"xx")
     assert gcs.cat(fn) == d + b"xx"
     assert gcs.info(fn)["contentType"] == "application/octet-stream"
+    # empty buffer on close
+    with gcs.open(fn, "wb", block_size=2**19) as f:
+        f.write(d)
+        f.write(b"xx")
+        f.write(d)
+    assert gcs.cat(fn) == d + b"xx" + d
+    assert gcs.info(fn)["contentType"] == "application/octet-stream"
+
+
+def test_multi_upload_with_kms(gcs):
+    if not gcs.on_google:
+        pytest.skip("emulator does not support kmsKeyName")
+
+    fn = TEST_BUCKET + "/test"
+    d = b"01234567" * 2**15
+
+    # something to write on close
+    with gcs.open(fn, "wb", content_type="text/plain", block_size=2**18) as f:
+        f.write(d)
+        f.write(b"xx")
+    assert gcs.cat(fn) == d + b"xx"
+    assert gcs.info(fn)["contentType"] == "text/plain"
+    # empty buffer on close
+    with gcs.open(
+        fn,
+        "wb",
+        content_type="text/plain",
+        block_size=2**19,
+        kms_key_name=TEST_KMS_KEY,
+    ) as f:
+        f.write(d)
+        f.write(b"xx")
+        f.write(d)
+    assert gcs.cat(fn) == d + b"xx" + d
+    assert gcs.info(fn)["contentType"] == "text/plain"
+    assert TEST_KMS_KEY in gcs.info(fn)["kmsKeyName"]
+
+    fn = TEST_BUCKET + "/test"
+    d = b"01234567" * 2**15
+
+    # something to write on close
+    with gcs.open(fn, "wb", block_size=2**18) as f:
+        f.write(d)
+        f.write(b"xx")
+    assert gcs.cat(fn) == d + b"xx"
+    assert gcs.info(fn)["contentType"] == "application/octet-stream"
+    assert "kmsKeyName" not in gcs.info(fn)
     # empty buffer on close
     with gcs.open(fn, "wb", block_size=2**19) as f:
         f.write(d)
@@ -870,8 +946,10 @@ def test_bigger_than_block_read(gcs):
 
 
 def test_current(gcs):
+    from gcsfs.tests import conftest
+
     assert GCSFileSystem.current() is gcs
-    gcs2 = GCSFileSystem(endpoint_url=gcs._endpoint, default_location=None)
+    gcs2 = GCSFileSystem(**conftest.params)
     assert gcs2.session is gcs.session
 
 
@@ -886,6 +964,36 @@ def test_array(gcs):
     with gcs.open(a, "rb") as f:
         out = f.read()
         assert out == b"A" * 1000
+
+
+def test_content_type_set(gcs):
+    fn = TEST_BUCKET + "/content_type"
+    with gcs.open(fn, "wb", content_type="text/html") as f:
+        f.write(b"<html>")
+    assert gcs.info(fn)["contentType"] == "text/html"
+
+
+def test_content_type_guess(gcs):
+    fn = TEST_BUCKET + "/content_type.txt"
+    with gcs.open(fn, "wb") as f:
+        f.write(b"zz")
+    assert gcs.info(fn)["contentType"] == "text/plain"
+
+
+def test_content_type_default(gcs):
+    fn = TEST_BUCKET + "/content_type.abcdef"
+    with gcs.open(fn, "wb") as f:
+        f.write(b"zz")
+    assert gcs.info(fn)["contentType"] == "application/octet-stream"
+
+
+def test_content_type_put_guess(gcs):
+    dst = TEST_BUCKET + "/content_type_put_guess"
+    with tmpfile(extension="txt") as fn:
+        with open(fn, "w") as f:
+            f.write("zz")
+        gcs.put(fn, f"gs://{dst}", b"")
+    assert gcs.info(dst)["contentType"] == "text/plain"
 
 
 def test_attrs(gcs):
@@ -1192,7 +1300,6 @@ def test_dir_marker(gcs):
 
 
 def test_mkdir_with_path(gcs):
-
     with pytest.raises(FileNotFoundError):
         gcs.mkdir(f"{TEST_BUCKET + 'new'}/path", create_parents=False)
     assert not gcs.exists(f"{TEST_BUCKET + 'new'}")
@@ -1426,6 +1533,8 @@ def test_expiry_keyword():
     assert gcs.dircache.listings_expiry_time == 1
     gcs = GCSFileSystem(cache_timeout=1, token="anon")
     assert gcs.dircache.listings_expiry_time == 1
+    gcs = GCSFileSystem(cache_timeout=0, token="anon")
+    assert gcs.dircache.listings_expiry_time == 0
 
 
 def test_copy_cache_invalidated(gcs):
@@ -1528,3 +1637,27 @@ def test_sign(gcs, monkeypatch):
 
     response = requests.get(result)
     assert response.text == "This is a test string"
+
+
+@pytest.mark.xfail(reason="emulator does not support condition")
+def test_write_x_mpu(gcs):
+    fn = TEST_BUCKET + "/test.file"
+    with gcs.open(fn, mode="xb", block_size=5 * 2**20) as f:
+        assert f.mode == "xb"
+        f.write(b"0" * 5 * 2**20)
+        f.write(b"done")
+    with pytest.raises(FileExistsError):
+        with gcs.open(fn, mode="xb", block_size=5 * 2**20) as f:
+            f.write(b"0" * 5 * 2**20)
+            f.write(b"done")
+
+
+def test_near_find(gcs):
+    gcs.touch(f"{TEST_BUCKET}/inner/aa/file")
+    out = gcs.find(f"{TEST_BUCKET}/inner/a")
+    assert not out
+
+
+def test_get_error(gcs):
+    with pytest.raises(FileNotFoundError):
+        gcs.get_file(f"{TEST_BUCKET}/doesnotexist", "other")

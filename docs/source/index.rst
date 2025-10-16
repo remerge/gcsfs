@@ -3,8 +3,6 @@ GCSFS
 
 A pythonic file-system interface to `Google Cloud Storage`_.
 
-This software is beta, use at your own risk.
-
 Please file issues and requests on github_ and we welcome pull requests.
 
 .. _github: https://github.com/fsspec/gcsfs/issues
@@ -206,6 +204,7 @@ Contents
    developer
    fuse
    changelog
+   code-of-conduct
    :maxdepth: 2
 
 
@@ -223,3 +222,12 @@ Indices and tables
 * :ref:`genindex`
 * :ref:`modindex`
 * :ref:`search`
+
+
+These docs pages collect anonymous tracking data using goatcounter, and the
+dashboard is available to the public: https://gcsfs.goatcounter.com/ .
+
+.. raw:: html
+
+    <script data-goatcounter="https://gcsfs.goatcounter.com/count"
+        async src="//gc.zgo.at/count.js"></script>

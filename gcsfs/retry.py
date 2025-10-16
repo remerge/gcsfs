@@ -71,6 +71,9 @@ def is_retriable(exception):
     """Returns True if this exception is retriable."""
 
     if isinstance(exception, HttpError):
+        # Add 401 to retriable errors when it's an auth expiration issue
+        if exception.code == 401 and "Invalid Credentials" in str(exception.message):
+            return True
         return exception.code in errs
 
     return isinstance(exception, RETRIABLE_EXCEPTIONS)
@@ -109,6 +112,8 @@ def validate_response(status, content, path, args=None):
 
         if status == 403:
             raise OSError(f"Forbidden: {path}\n{msg}")
+        elif status == 412:
+            raise FileExistsError(path)
         elif status == 502:
             raise requests.exceptions.ProxyError()
         elif "invalid" in str(msg):

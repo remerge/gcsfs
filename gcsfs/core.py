@@ -1,10 +1,12 @@
 """
 Google Cloud Storage pythonic interface
 """
+
 import asyncio
 import io
 import json
 import logging
+import mimetypes
 import os
 import posixpath
 import re
@@ -15,6 +17,7 @@ from urllib.parse import parse_qs
 from urllib.parse import quote as quote_urllib
 from urllib.parse import urlsplit
 
+import aiohttp
 import fsspec
 from fsspec import asyn
 from fsspec.callbacks import NoOpCallback
@@ -119,8 +122,8 @@ def _location():
     -------
     valid http location
     """
-    _emulator_location = os.getenv("STORAGE_EMULATOR_HOST", None)
-    if _emulator_location:
+    _emulator_location = os.getenv("STORAGE_EMULATOR_HOST", "")
+    if _emulator_location not in {"default", "", None}:
         if not any(
             _emulator_location.startswith(scheme) for scheme in ("http://", "https://")
         ):
@@ -153,6 +156,10 @@ def _coalesce_generation(*args):
         return None
     else:
         return generations.pop()
+
+
+def _is_directory_marker(entry):
+    return entry["size"] == 0 and entry["name"].endswith("/")
 
 
 class GCSFileSystem(asyn.AsyncFileSystem):
@@ -214,10 +221,21 @@ class GCSFileSystem(asyn.AsyncFileSystem):
     GCSFileSystem maintains a per-implied-directory cache of object listings and
     fulfills all object information and listing requests from cache. This implied, for example, that objects
     created via other processes *will not* be visible to the GCSFileSystem until the cache
-    refreshed. Calls to GCSFileSystem.open and calls to GCSFile are not effected by this cache.
+    refreshed. Calls to GCSFileSystem.open and calls to GCSFile are not affected by this cache.
+
+    Note that directory listings are cached by default, because fetching those listings can be expensive. This is
+    contrary to local filesystem behaviour. The cache will be cleared if writing from this instance, but it can
+    become stale and return incorrect results if the storage is written to from another process/machine.
+    If you anticipate this possibility, you can set the use_listings_cache and listings_expiry_time arguments
+    to configure the caching, call `.invalidate_cache()` when required, or pass `refresh=True` to the
+    various listing methods.
 
     In the default case the cache is never expired. This may be controlled via the ``cache_timeout``
     GCSFileSystem parameter or via explicit calls to ``GCSFileSystem.invalidate_cache``.
+
+    NOTE on "exclusive" mode: mode=="create"" (in pipe and put) and open(mode="xb") are supported on an
+    experimental basis. The test harness does not currently support this, so use at your
+    own risk.
 
     Parameters
     ----------
@@ -289,7 +307,7 @@ class GCSFileSystem(asyn.AsyncFileSystem):
         version_aware=False,
         **kwargs,
     ):
-        if cache_timeout:
+        if cache_timeout is not None:
             kwargs["listings_expiry_time"] = cache_timeout
         super().__init__(
             self,
@@ -320,7 +338,9 @@ class GCSFileSystem(asyn.AsyncFileSystem):
                 DeprecationWarning,
             )
 
-        self.credentials = GoogleCredentials(project, access, token)
+        self.credentials = GoogleCredentials(
+            project, access, token, on_google=self.on_google
+        )
 
     @property
     def _location(self):
@@ -342,27 +362,43 @@ class GCSFileSystem(asyn.AsyncFileSystem):
     # in-thread asynchronous cleanup first, then fallback to synchronous
     # cleanup (which can handle cross-thread calls).
     @staticmethod
-    def close_session(loop, session):
-        if loop is not None and session is not None:
+    def close_session(loop, session: aiohttp.ClientSession, asynchronous=False):
+        if session.closed:
+            return
+        force_close = False
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if loop:
+            # an explicit loop was set
             if loop.is_running():
-                try:
-                    current_loop = asyncio.get_running_loop()
-                    current_loop.create_task(session.close())
-                    return
-                except RuntimeError:
-                    pass
-
-                try:
-                    asyn.sync(loop, session.close, timeout=0.1)
-                except fsspec.FSTimeoutError:
-                    pass
+                loop.create_task(session.close())
             else:
-                pass
+                force_close = True
+        elif current_loop is not None and current_loop.is_running() and asynchronous:
+            # running in a concurrnet context
+            current_loop.create_task(session.close())
+        elif asyn.loop[0] is not None and asyn.loop[0].is_running():
+            try:
+                asyn.sync(asyn.loop[0], session.close, timeout=0.1)
+            except fsspec.FSTimeoutError:
+                force_close = True
+        else:
+            force_close = True
+        if force_close:
+            # during shutdown, this is the fallback
+            connector = getattr(session, "_connector", None)
+            if connector is not None:
+                # close after loop is dead
+                connector._close()
 
     async def _set_session(self):
         if self._session is None:
             self._session = await get_client(**self.session_kwargs)
-            weakref.finalize(self, self.close_session, self.loop, self._session)
+            weakref.finalize(
+                self, self.close_session, self.loop, self._session, self.asynchronous
+            )
         return self._session
 
     @property
@@ -595,27 +631,32 @@ class GCSFileSystem(asyn.AsyncFileSystem):
                 return [await self._get_object(path)]
             else:
                 return []
-        dirty_out = pseudodirs + items
+        out_with_markers = pseudodirs + items
 
-        out = []
-        for entry in dirty_out:
-            if (
-                entry["name"].rstrip("/") == path
-                and entry.get("kind", "") == "storage#object"
-                and (entry.get("size", "") == "0" or entry.get("size", "") == 0)
-                and entry.get("crc32c", "") == "AAAAAA=="
-            ):
-                # this is the "ghost" object of an empty folder, skip it
-                continue
-            out.append(entry)
+        if not kwargs.get("keep_markers"):
+            out = []
+            for entry in out_with_markers:
+                if (
+                    entry["name"].rstrip("/") == path
+                    and entry.get("kind", "") == "storage#object"
+                    and (entry.get("size", "") == "0" or entry.get("size", "") == 0)
+                    and entry.get("crc32c", "") == "AAAAAA=="
+                ):
+                    # this is the "ghost" marker object of an empty folder, skip it
+                    continue
+                out.append(entry)
+        else:
+            out = out_with_markers
 
         use_snapshot_listing = inventory_report_info and inventory_report_info.get(
             "use_snapshot_listing"
         )
 
+        max_results = kwargs.get("max_results")
+
         # Don't cache prefixed/partial listings, in addition to
         # not using the inventory report service to do listing directly.
-        if not prefix and not use_snapshot_listing:
+        if not prefix and not use_snapshot_listing and not max_results:
             self.dircache[path] = out
         return out
 
@@ -669,7 +710,7 @@ class GCSFileSystem(asyn.AsyncFileSystem):
                 end_offset=None,
                 prefix=prefix,
                 versions=versions,
-                page_size=default_page_size,
+                max_results=max_results,
             )
 
     async def _concurrent_list_objects_helper(
@@ -722,7 +763,7 @@ class GCSFileSystem(asyn.AsyncFileSystem):
                     end_offset=end_offsets[i],
                     prefix=prefix,
                     versions=versions,
-                    page_size=page_size,
+                    max_results=page_size,
                 )
                 for i in range(0, len(start_offsets))
             ]
@@ -747,15 +788,16 @@ class GCSFileSystem(asyn.AsyncFileSystem):
         end_offset,
         prefix,
         versions,
-        page_size,
+        max_results,
+        items_per_call=1000,
     ):
         """
         Sequential list objects within the start and end offset range.
         """
-
+        max_results = max_results if max_results else 10_000_000
         prefixes = []
         items = []
-
+        num_items = min(items_per_call, max_results, 1000)
         page = await self._call(
             "GET",
             "b/{}/o",
@@ -764,7 +806,7 @@ class GCSFileSystem(asyn.AsyncFileSystem):
             prefix=prefix,
             startOffset=start_offset,
             endOffset=end_offset,
-            maxResults=page_size,
+            maxResults=num_items,
             json_out=True,
             versions="true" if versions else None,
         )
@@ -773,7 +815,8 @@ class GCSFileSystem(asyn.AsyncFileSystem):
         items.extend(page.get("items", []))
         next_page_token = page.get("nextPageToken", None)
 
-        while next_page_token is not None:
+        while len(items) < max_results and next_page_token is not None:
+            num_items = min(items_per_call, max_results - len(items), 1000)
             page = await self._call(
                 "GET",
                 "b/{}/o",
@@ -782,7 +825,7 @@ class GCSFileSystem(asyn.AsyncFileSystem):
                 prefix=prefix,
                 startOffset=start_offset,
                 endOffset=end_offset,
-                maxResults=page_size,
+                maxResults=num_items,
                 pageToken=next_page_token,
                 json_out=True,
                 versions="true" if versions else None,
@@ -854,7 +897,7 @@ class GCSFileSystem(asyn.AsyncFileSystem):
         acl="projectPrivate",
         default_acl="bucketOwnerFullControl",
         location=None,
-        create_parents=True,
+        create_parents=False,
         enable_versioning=False,
         enable_object_retention=False,
         iam_configuration=None,
@@ -907,10 +950,11 @@ class GCSFileSystem(asyn.AsyncFileSystem):
         if "/" in path and create_parents and await self._exists(bucket):
             # nothing to do
             return
-        if "/" in path and not create_parents:
+        if "/" in path:
             if await self._exists(bucket):
                 return
-            raise FileNotFoundError(bucket)
+            if not create_parents:
+                raise FileNotFoundError(bucket)
 
         json_data = {"name": bucket}
         location = location or self.default_location
@@ -966,12 +1010,12 @@ class GCSFileSystem(asyn.AsyncFileSystem):
     def _parse_timestamp(self, timestamp):
         assert timestamp.endswith("Z")
         timestamp = timestamp[:-1]
-        timestamp = timestamp + "0" * (6 - len(timestamp.rsplit(".", 1)[1]))
+        timestamp = timestamp + "0" * (6 - len(timestamp.rsplit(".", 1)[-1]))
         return datetime.fromisoformat(timestamp + "+00:00")
 
     async def _info(self, path, generation=None, **kwargs):
         """File information about this path."""
-        path = self._strip_protocol(path)
+        path = self._strip_protocol(path).rstrip("/")
         if "/" not in path:
             try:
                 out = await self._call("GET", f"b/{path}", json_out=True)
@@ -1000,7 +1044,7 @@ class GCSFileSystem(asyn.AsyncFileSystem):
             # this is a directory
             return {
                 "bucket": bucket,
-                "name": path.rstrip("/"),
+                "name": path,
                 "size": 0,
                 "storageClass": "DIRECTORY",
                 "type": "directory",
@@ -1009,21 +1053,20 @@ class GCSFileSystem(asyn.AsyncFileSystem):
         try:
             exact = await self._get_object(path)
             # this condition finds a "placeholder" - still need to check if it's a directory
-            if exact["size"] or not exact["name"].endswith("/"):
+            if not _is_directory_marker(exact):
                 return exact
         except FileNotFoundError:
             pass
-        kwargs["detail"] = True  # Force to true for info
-        out = await self._ls(path, **kwargs)
-        out0 = next((o for o in out if o["name"].rstrip("/") == path), None)
-        if out0 and out0["name"][-1] != "/" and out0["size"] == 0:
+        out = await self._list_objects(path, max_results=1, keep_markers=True)
+        exact = next((o for o in out if o["name"].rstrip("/") == path), None)
+        if exact and not _is_directory_marker(exact):
             # exact hit
-            return out0
+            return exact
         elif out:
             # other stuff - must be a directory
             return {
                 "bucket": bucket,
-                "name": path.rstrip("/"),
+                "name": path,
                 "size": 0,
                 "storageClass": "DIRECTORY",
                 "type": "directory",
@@ -1043,18 +1086,36 @@ class GCSFileSystem(asyn.AsyncFileSystem):
             out = await self._list_buckets()
         else:
             out = []
+            dir_names = set()
             for entry in await self._list_objects(
                 path, prefix=prefix, versions=versions, **kwargs
             ):
+                if _is_directory_marker(entry):
+                    entry = {
+                        "bucket": entry["bucket"],
+                        "name": path.rstrip("/"),
+                        "size": 0,
+                        "storageClass": "DIRECTORY",
+                        "type": "directory",
+                    }
+
+                if entry["type"] == "directory":
+                    if entry["name"] in dir_names:
+                        continue
+                    dir_names.add(entry["name"])
+
                 if versions and "generation" in entry:
                     entry = entry.copy()
                     entry["name"] = f"{entry['name']}#{entry['generation']}"
+
                 out.append(entry)
+
+        out.sort(key=lambda e: (e["name"]))
 
         if detail:
             return out
         else:
-            return sorted([o["name"] for o in out])
+            return [o["name"] for o in out]
 
     def url(self, path):
         """Get HTTP URL of the given path"""
@@ -1231,7 +1292,14 @@ class GCSFileSystem(asyn.AsyncFileSystem):
             parts = []
             for i, p in enumerate(chunk):
                 bucket, key, generation = self.split_path(p)
-                query = f"?generation={generation}" if generation else ""
+                query_params = self._get_params(
+                    {"generation": generation} if generation else {}
+                )
+                query = (
+                    ("?" + "&".join(f"{k}={v}" for k, v in query_params.items()))
+                    if query_params
+                    else ""
+                )
                 parts.append(
                     template.format(
                         i=i + 1,
@@ -1341,13 +1409,14 @@ class GCSFileSystem(asyn.AsyncFileSystem):
         content_type="application/octet-stream",
         fixed_key_metadata=None,
         chunksize=50 * 2**20,
+        mode="overwrite",
     ):
         # enforce blocksize should be a multiple of 2**18
         consistency = consistency or self.consistency
         bucket, key, generation = self.split_path(path)
         size = len(data)
         out = None
-        if size < 5 * 2**20:
+        if size < chunksize:
             location = await simple_upload(
                 self,
                 bucket,
@@ -1357,6 +1426,7 @@ class GCSFileSystem(asyn.AsyncFileSystem):
                 consistency,
                 content_type,
                 fixed_key_metadata=fixed_key_metadata,
+                mode=mode,
             )
         else:
             location = await initiate_upload(
@@ -1366,12 +1436,20 @@ class GCSFileSystem(asyn.AsyncFileSystem):
                 content_type,
                 metadata,
                 fixed_key_metadata=fixed_key_metadata,
+                mode=mode,
             )
-            for offset in range(0, len(data), chunksize):
-                bit = data[offset : offset + chunksize]
-                out = await upload_chunk(
-                    self, location, bit, offset, size, content_type
+            try:
+                for offset in range(0, len(data), chunksize):
+                    bit = data[offset : offset + chunksize]
+                    out = await upload_chunk(
+                        self, location, bit, offset, size, content_type
+                    )
+            except Exception:
+                await self._call(
+                    "DELETE",
+                    location.replace("&ifGenerationMatch=0", ""),
                 )
+                raise
 
             checker = get_consistency_checker(consistency)
             checker.update(data)
@@ -1386,15 +1464,20 @@ class GCSFileSystem(asyn.AsyncFileSystem):
         rpath,
         metadata=None,
         consistency=None,
-        content_type="application/octet-stream",
+        content_type=None,
         chunksize=50 * 2**20,
         callback=None,
         fixed_key_metadata=None,
+        mode="overwrite",
         **kwargs,
     ):
         # enforce blocksize should be a multiple of 2**18
         if os.path.isdir(lpath):
             return
+        if content_type is None:
+            content_type, _ = mimetypes.guess_type(lpath)
+            if content_type is None:
+                content_type = "application/octet-stream"
         callback = callback or NoOpCallback()
         consistency = consistency or self.consistency
         checker = get_consistency_checker(consistency)
@@ -1416,6 +1499,7 @@ class GCSFileSystem(asyn.AsyncFileSystem):
                     metadatain=metadata,
                     content_type=content_type,
                     fixed_key_metadata=fixed_key_metadata,
+                    mode=mode,
                 )
                 callback.absolute_update(size)
 
@@ -1427,24 +1511,33 @@ class GCSFileSystem(asyn.AsyncFileSystem):
                     content_type,
                     metadata=metadata,
                     fixed_key_metadata=fixed_key_metadata,
+                    mode=mode,
                 )
                 offset = 0
-                while True:
-                    bit = f0.read(chunksize)
-                    if not bit:
-                        break
-                    out = await upload_chunk(
-                        self, location, bit, offset, size, content_type
+                try:
+                    while True:
+                        bit = f0.read(chunksize)
+                        if not bit:
+                            break
+                        out = await upload_chunk(
+                            self, location, bit, offset, size, content_type
+                        )
+                        offset += len(bit)
+                        callback.absolute_update(offset)
+                        checker.update(bit)
+                except Exception:
+                    await self._call(
+                        "DELETE",
+                        self.location.replace("&ifGenerationMatch=0", ""),
                     )
-                    offset += len(bit)
-                    callback.absolute_update(offset)
-                    checker.update(bit)
+                    raise
 
                 checker.validate_json_response(out)
 
             self.invalidate_cache(self._parent(rpath))
 
     async def _isdir(self, path):
+
         try:
             return (await self._info(path))["type"] == "directory"
         except OSError:
@@ -1481,10 +1574,17 @@ class GCSFileSystem(asyn.AsyncFileSystem):
             objects, _ = await self._do_list_objects(
                 bucket, delimiter="", prefix=_prefix, versions=versions
             )
+        else:
+            _prefix = prefix
 
         dirs = {}
         cache_entries = {}
+        path2 = path.rstrip("/") + "/"
 
+        if not prefix:
+            objects = [
+                o for o in objects if o["name"].startswith(path2) or o["name"] == path
+            ]
         for obj in objects:
             parent = self._parent(obj["name"])
             previous = obj
@@ -1544,7 +1644,7 @@ class GCSFileSystem(asyn.AsyncFileSystem):
             headers=self._get_headers(headers),
             timeout=self.requests_timeout,
         ) as r:
-            r.raise_for_status()
+            validate_response(r.status, None, rpath)
             try:
                 size = int(r.headers["content-length"])
             except (KeyError, ValueError):
@@ -1716,6 +1816,7 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
         timeout=None,
         fixed_key_metadata=None,
         generation=None,
+        kms_key_name=None,
         **kwargs,
     ):
         """
@@ -1740,7 +1841,8 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
             the number we wrote; 'md5' does a full checksum. Any value other
             than 'size' or 'md5' or 'crc32c' is assumed to mean no checking.
         content_type: str
-            default is `application/octet-stream`. See the list of available
+            default when unspecified is provided by mimetypes.guess_type or
+            otherwise `application/octet-stream`. See the list of available
             content types at https://www.iana.org/assignments/media-types/media-types.txt
         metadata: dict
             Custom metadata, in key/value pairs, added at file creation
@@ -1753,6 +1855,11 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
                 - custom_time
             More info:
             https://cloud.google.com/storage/docs/metadata#mutable
+        kms_key_name: str
+            Resource name of the Cloud KMS key that will be used to encrypt
+            the object.
+            More info:
+            https://cloud.google.com/storage/docs/encryption/customer-managed-keys
         timeout: int
             Timeout seconds for the asynchronous callback.
         generation: str
@@ -1778,18 +1885,26 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
         self.acl = acl
         self.checker = get_consistency_checker(consistency)
 
+        if "a" in self.mode:
+            warnings.warn(
+                "Append mode 'a' is not supported in GCS. Using overwrite mode instead."
+            )
+            self.mode = self.mode.replace("a", "w")
+
         if "r" in self.mode:
             det = self.details
         else:
             det = {}
         self.content_type = content_type or det.get(
-            "contentType", "application/octet-stream"
+            "contentType",
+            mimetypes.guess_type(self.path)[0] or "application/octet-stream",
         )
         self.metadata = metadata or det.get("metadata", {})
         self.fixed_key_metadata = _convert_fixed_key_metadata(det, from_google=True)
         self.fixed_key_metadata.update(fixed_key_metadata or {})
+        self.kms_key_name = kms_key_name
         self.timeout = timeout
-        if mode == "wb":
+        if mode in {"wb", "xb"}:
             if self.blocksize < GCS_MIN_BLOCK_SIZE:
                 warnings.warn("Setting block size to minimum value, 2**18")
                 self.blocksize = GCS_MIN_BLOCK_SIZE
@@ -1895,6 +2010,8 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
             self.content_type,
             self.metadata,
             self.fixed_key_metadata,
+            mode="create" if "x" in self.mode else "overwrite",
+            kms_key_name=self.kms_key_name,
             timeout=self.timeout,
         )
 
@@ -1907,7 +2024,7 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
             return
         self.gcsfs.call(
             "DELETE",
-            self.location,
+            self.location.replace("&ifGenerationMatch=0", ""),
         )
         self.location = None
         self.closed = True
@@ -1927,6 +2044,8 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
             self.consistency,
             self.content_type,
             self.fixed_key_metadata,
+            mode="create" if "x" in self.mode else "overwrite",
+            kms_key_name=self.kms_key_name,
             timeout=self.timeout,
         )
 
@@ -1998,17 +2117,23 @@ async def initiate_upload(
     content_type="application/octet-stream",
     metadata=None,
     fixed_key_metadata=None,
+    mode="overwrite",
+    kms_key_name=None,
 ):
     j = {"name": key}
     if metadata:
         j["metadata"] = metadata
+    kw = {"ifGenerationMatch": "0"} if mode == "create" else {}
+    if kms_key_name:
+        kw["kmsKeyName"] = kms_key_name
     j.update(_convert_fixed_key_metadata(fixed_key_metadata))
     headers, _ = await fs._call(
         method="POST",
-        path=f"{fs._location}/upload/storage/v1/b/{quote(bucket)}/o",
+        path=f"{fs._location}/upload/storage/v1/b/{quote(bucket)}/o?name={quote(key)}",
         uploadType="resumable",
         json=j,
         headers={"X-Upload-Content-Type": content_type},
+        **kw,
     )
     loc = headers["Location"]
     out = loc[0] if isinstance(loc, list) else loc  # <- for CVR responses
@@ -2026,12 +2151,17 @@ async def simple_upload(
     consistency=None,
     content_type="application/octet-stream",
     fixed_key_metadata=None,
+    mode="overwrite",
+    kms_key_name=None,
 ):
     checker = get_consistency_checker(consistency)
     path = f"{fs._location}/upload/storage/v1/b/{quote(bucket)}/o"
     metadata = {"name": key}
     if metadatain is not None:
         metadata["metadata"] = metadatain
+    kw = {"ifGenerationMatch": "0"} if mode == "create" else {}
+    if kms_key_name:
+        kw["kmsKeyName"] = kms_key_name
     metadata.update(_convert_fixed_key_metadata(fixed_key_metadata))
     metadata = json.dumps(metadata)
     template = (
@@ -2048,6 +2178,7 @@ async def simple_upload(
         headers={"Content-Type": 'multipart/related; boundary="==0=="'},
         data=UnclosableBytesIO(data),
         json_out=True,
+        **kw,
     )
     checker.update(datain)
     checker.validate_json_response(j)

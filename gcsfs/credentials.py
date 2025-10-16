@@ -5,6 +5,7 @@ import pickle
 import textwrap
 import threading
 import warnings
+from datetime import datetime, timezone
 
 import google.auth as gauth
 import google.auth.compute_engine
@@ -15,6 +16,8 @@ from google.auth.transport.requests import Request
 from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
+
+from gcsfs.retry import HttpError
 
 logger = logging.getLogger("gcsfs.credentials")
 
@@ -37,7 +40,7 @@ client_config = {
 
 
 class GoogleCredentials:
-    def __init__(self, project, access, token, check_credentials=None):
+    def __init__(self, project, access, token, check_credentials=None, on_google=True):
         self.scope = "https://www.googleapis.com/auth/devstorage." + access
         self.project = project
         self.access = access
@@ -47,6 +50,7 @@ class GoogleCredentials:
         self.method = None
         self.lock = threading.Lock()
         self.token = token
+        self.on_google = on_google
         self.connect(method=token)
 
         if check_credentials:
@@ -90,6 +94,8 @@ class GoogleCredentials:
         self.credentials = credentials
 
     def _connect_cloud(self):
+        if not self.on_google:
+            raise ValueError
         self.credentials = gauth.compute_engine.Credentials()
         try:
             with requests.Session() as session:
@@ -99,7 +105,6 @@ class GoogleCredentials:
             raise ValueError("Invalid gcloud credentials") from error
 
     def _connect_cache(self):
-
         if len(self.tokens) == 0:
             raise ValueError("No cached tokens")
 
@@ -167,20 +172,51 @@ class GoogleCredentials:
         if self.credentials.valid:
             self.credentials.apply(self.heads)
 
-    def maybe_refresh(self):
-        # this uses requests and is blocking
+    def _credentials_valid(self, refresh_buffer):
+        return (
+            self.credentials.valid
+            # In addition to checking current validity, we ensure that there is
+            # not a near-future expiry to avoid errors when expiration hits.
+            and (
+                (
+                    self.credentials.expiry
+                    and (
+                        self.credentials.expiry.replace(tzinfo=timezone.utc)
+                        - datetime.now(timezone.utc)
+                    ).total_seconds()
+                    > refresh_buffer
+                )
+                or not self.credentials.expiry
+            )
+        )
+
+    def maybe_refresh(self, refresh_buffer=300):
+        """
+        Check and refresh credentials if needed
+        """
         if self.credentials is None:
             return  # anon
-        if self.credentials.valid:
-            return  # still good
+
+        if self._credentials_valid(refresh_buffer):
+            return  # still good, with buffer
+
         with requests.Session() as session:
             req = Request(session)
             with self.lock:
-                if self.credentials.valid:
-                    return  # repeat to avoid race (but don't want lock in common case)
+                if self._credentials_valid(refresh_buffer):
+                    return  # repeat check to avoid race conditions
+
                 logger.debug("GCS refresh")
-                self.credentials.refresh(req)
-                self.apply(self.heads)
+                try:
+                    self.credentials.refresh(req)
+                except gauth.exceptions.RefreshError as error:
+                    # Re-raise as HttpError with a 401 code and the expected message
+                    raise HttpError(
+                        {"code": 401, "message": "Invalid Credentials"}
+                    ) from error
+
+                # https://github.com/fsspec/filesystem_spec/issues/565
+                self.credentials.apply(self.heads)
 
     def apply(self, out):
         """Insert credential headers in-place to a dictionary"""
@@ -189,7 +225,7 @@ class GoogleCredentials:
             self.credentials.apply(out)
 
     def _connect_service(self, fn):
-        # raises exception if file does not match expectation
+        # raises exception if the file does not match expectation
         credentials = service_account.Credentials.from_service_account_file(
             fn, scopes=[self.scope]
         )
@@ -222,7 +258,6 @@ class GoogleCredentials:
             "cloud",
             "token",
             "anon",
-            "browser",
             None,
         ]:
             self._connect_token(method)

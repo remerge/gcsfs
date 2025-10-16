@@ -1,8 +1,86 @@
 Changelog
 =========
 
-Note: in some releases, there are no changes, because we always guarantee relasing in step
-with fsspec.
+Note: in some releases, there are no changes, because we always guarantee
+releasing in step with fsspec.
+
+2025.9.0
+--------
+
+* fix slow ls iterations (#697)
+* Ensure right error type for get() on nonexistent (#695)
+
+2025.7.0
+--------
+
+* acknowledge Anaconda support (#691)
+* less refreshing for CI (#690)
+
+2025.5.1
+--------
+
+* Fix token timezone comparison (#683, 688)
+
+2025.5.0
+--------
+
+* Avoid deprecated utcnow (#680)
+* Add support for specifying Cloud KMS keys when creating files (#679)
+* Yet another fix for isdir (#676)
+* Create warning for appending mode 'a' operations (#675)
+* add userProject to batch deletion query (#673)
+
+2025.3.2
+--------
+
+no changes
+
+2025.3.1
+--------
+
+* Fix find with path not ending with "/" (#668)
+* remove "beta" note from doc (#666)
+* don't check expiry of creds that don't expire (#665)
+
+2025.3.0
+--------
+
+* Improvements for credentials refresh under high load (#658)
+
+2025.2.0
+--------
+
+* guess upload file MIME types (#655)
+* better shutdown cleanup (#657)
+
+2024.12.0
+---------
+
+* Exclusive write (#651)
+* Avoid IndexError on integer seconds (#649)
+* note on non-posixness (#648)
+* handle chache_timeout=0 (#646)
+
+2024.10.0
+---------
+
+* Remove race condition in credentials (#643)
+* fix md5 hash order logic (#640)
+
+2024.9.0
+--------
+
+* In case error in a pure string (#631)
+
+2024.6.1
+--------
+
+no changes
+
+2024.6.0
+--------
+
+* Add seek(0) to request data to prevent issues on retries (#624)
 
 2024.6.1
 --------
