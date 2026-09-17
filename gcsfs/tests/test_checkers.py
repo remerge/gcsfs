@@ -54,7 +54,7 @@ def google_json_response_from_data(expected_data: bytes, actual_data=None):
 
     response = {"md5Hash": checksum_b64, "size": len(actual_data)}
 
-    # some manual checksums verified using gsutil ls -L
+    # some manual checksums verified using gcloud storage ls -L
     # also can add using https://crccalc.com/
     # be careful about newlines
     crc32c_points = {
